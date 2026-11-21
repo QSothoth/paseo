@@ -950,6 +950,127 @@ lines.on("line", (line) => {
     }
   });
 
+  it("filters ACP listed sessions by query across nextCursor pages before applying limit", async () => {
+    const requestedCursors: Array<string | undefined> = [];
+    const harness = connectorHarness({
+      capabilities: { sessionCapabilities: { list: {} } },
+      handleRequest(instance, request) {
+        if (request.method !== "session/list") return false;
+        const params = (request.params ?? {}) as { cursor?: string; cwd?: string };
+        requestedCursors.push(params.cursor);
+        if (!params.cursor) {
+          instance.respond(request, {
+            sessions: [
+              { sessionId: "s-1", cwd: "/work/alpha", title: "Alpha task" },
+              { sessionId: "s-2", cwd: "/work/beta", title: "Beta task" },
+            ],
+            nextCursor: "page-2",
+          });
+        } else if (params.cursor === "page-2") {
+          instance.respond(request, {
+            sessions: [
+              { sessionId: "s-3", cwd: "/work/gamma", title: "Needle title match" },
+              { sessionId: "s-4", cwd: "/work/needle-repo", title: "Repo basename match" },
+              { sessionId: "s-5", cwd: "/work/delta", title: "Needle third match" },
+            ],
+            nextCursor: "page-3",
+          });
+        } else {
+          instance.respond(request, {
+            sessions: [{ sessionId: "s-6", cwd: "/work/needle-late", title: "Should not fetch" }],
+            nextCursor: null,
+          });
+        }
+        return true;
+      },
+    });
+    const registration = runAcpProvider({
+      id: "paged-list-acp",
+      label: "Paged List ACP",
+      connector: harness.connector,
+    });
+    const connection = await registration.connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.list"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    try {
+      await connection.send({
+        type: "sessions",
+        requestId: "paged-query",
+        query: "needle",
+        limit: 2,
+      });
+      const listed = await waitForEvent(
+        events,
+        (event) => event.type === "sessions" && event.requestId === "paged-query",
+      );
+      expect(listed).toMatchObject({
+        type: "sessions",
+        sessions: [
+          {
+            persistence: { version: 1, data: { sessionId: "s-3" } },
+            cwd: "/work/gamma",
+            title: "Needle title match",
+          },
+          {
+            persistence: { version: 1, data: { sessionId: "s-4" } },
+            cwd: "/work/needle-repo",
+            title: "Repo basename match",
+          },
+        ],
+      });
+      expect(requestedCursors).toEqual([undefined, "page-2"]);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("stops ACP session pagination if an agent repeats a nextCursor", async () => {
+    let calls = 0;
+    const harness = connectorHarness({
+      capabilities: { sessionCapabilities: { list: {} } },
+      handleRequest(instance, request) {
+        if (request.method !== "session/list") return false;
+        calls += 1;
+        instance.respond(request, {
+          sessions: [{ sessionId: `s-${calls}`, cwd: "/work/app", title: `Page ${calls}` }],
+          nextCursor: "same-cursor",
+        });
+        return true;
+      },
+    });
+    const registration = runAcpProvider({
+      id: "loop-list-acp",
+      label: "Loop List ACP",
+      connector: harness.connector,
+    });
+    const connection = await registration.connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.list"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    try {
+      await connection.send({ type: "sessions", requestId: "loop-query", limit: 10 });
+      const listed = await waitForEvent(
+        events,
+        (event) => event.type === "sessions" && event.requestId === "loop-query",
+      );
+      expect(listed).toMatchObject({
+        type: "sessions",
+        sessions: [
+          { persistence: { version: 1, data: { sessionId: "s-1" } } },
+          { persistence: { version: 1, data: { sessionId: "s-2" } } },
+        ],
+      });
+      expect(calls).toBe(2);
+    } finally {
+      await connection.close();
+    }
+  });
+
   it("still reports initialization failures for workspace-only global discovery", async () => {
     let unavailable = false;
     const { connector } = connectorHarness({

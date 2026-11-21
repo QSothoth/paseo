@@ -1,4 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { basename } from "node:path";
 import { spawnProcess, terminateProcess } from "../process.js";
 import { Readable, Writable } from "node:stream";
 import {
@@ -283,6 +284,18 @@ async function discover(
   }
 }
 
+const MAX_SESSION_LIST_SCAN = 500;
+
+function matchesSessionQuery(
+  session: { title?: string | null; cwd: string },
+  rawQuery: string | undefined,
+): boolean {
+  const query = rawQuery?.trim().toLowerCase();
+  if (!query) return true;
+  const cwdBasename = basename(session.cwd.replaceAll("\\", "/"));
+  return [session.title, cwdBasename].some((value) => value?.toLowerCase().includes(query));
+}
+
 async function listSessions(
   input: Extract<ProviderInput, { type: "sessions" }>,
   state: AcpConnectionState,
@@ -295,17 +308,38 @@ async function listSessions(
     emit: state.emit,
   });
   try {
-    const response = await runtime.listSessions(input.cwd);
-    const selected = input.limit ? response.sessions.slice(0, input.limit) : response.sessions;
+    const limit = input.limit ?? Number.POSITIVE_INFINITY;
+    const selected: Array<{
+      persistence: ProviderPersistence;
+      cwd: string;
+      title?: string;
+      updatedAt?: string;
+    }> = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    let scanned = 0;
+    while (selected.length < limit && scanned < MAX_SESSION_LIST_SCAN) {
+      const response = await runtime.listSessions(input.cwd, cursor);
+      for (const session of response.sessions) {
+        if (scanned >= MAX_SESSION_LIST_SCAN || selected.length >= limit) break;
+        scanned += 1;
+        if (!matchesSessionQuery(session, input.query)) continue;
+        selected.push({
+          persistence: nativePersistence(session.sessionId),
+          cwd: session.cwd,
+          title: session.title ?? undefined,
+          updatedAt: session.updatedAt ?? undefined,
+        });
+      }
+      const nextCursor = response.nextCursor ?? undefined;
+      if (!nextCursor || seenCursors.has(nextCursor)) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
     state.emit({
       type: "sessions",
       requestId: input.requestId,
-      sessions: selected.map((session) => ({
-        persistence: nativePersistence(session.sessionId),
-        cwd: session.cwd,
-        title: session.title ?? undefined,
-        updatedAt: session.updatedAt ?? undefined,
-      })),
+      sessions: selected,
     });
   } finally {
     await runtime.close();
@@ -885,8 +919,13 @@ class AcpRuntime {
     return true;
   }
 
-  listSessions(cwd?: string) {
-    return this.call(this.connection.listSessions({ cwd }));
+  listSessions(cwd?: string, cursor?: string) {
+    return this.call(
+      this.connection.listSessions({
+        ...(cwd !== undefined ? { cwd } : {}),
+        ...(cursor !== undefined ? { cursor } : {}),
+      }),
+    );
   }
 
   async drainNotifications(): Promise<void> {
