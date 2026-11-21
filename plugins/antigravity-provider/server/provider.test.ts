@@ -39,6 +39,47 @@ it("reports a CLI without the acp subcommand as unavailable", async () => {
   });
 });
 
+it("coalesces concurrent status() probes and caches the result for the same launch", async () => {
+  const { launch } = await launchAgent(`
+    const { appendFileSync } = require("node:fs");
+    const { createInterface } = require("node:readline");
+    appendFileSync(process.env.CAPTURE, "started\\n");
+    const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+    createInterface({ input: process.stdin }).on("line", (line) => {
+      const { id, method } = JSON.parse(line);
+      if (method === "initialize") {
+        setTimeout(() => send({ id, result: { protocolVersion: 1 } }), 60);
+      }
+    });
+  `);
+  const provider = createAntigravityProvider();
+  const [first, second] = await Promise.all([
+    provider.status!({ launch }),
+    provider.status!({ launch }),
+  ]);
+  const third = await provider.status!({ launch });
+  expect(first).toEqual({ available: true });
+  expect(second).toEqual({ available: true });
+  expect(third).toEqual({ available: true });
+  const starts = (await readFile(launch.env.CAPTURE, "utf8")).trim().split("\n");
+  expect(starts).toHaveLength(1);
+});
+
+it("includes underlying startup failure detail in status() diagnostic", async () => {
+  const { directory } = await launchAgent("");
+  const provider = createAntigravityProvider();
+  const result = await provider.status!({
+    launch: {
+      command: path.join(directory, "missing-agy"),
+      args: ["acp"],
+      env: {},
+    },
+  });
+  expect(result.available).toBe(false);
+  expect(result.diagnostic).toContain("1.5.0");
+  expect(result.diagnostic).toMatch(/ENOENT|spawn/u);
+});
+
 it("publishes Antigravity skills separately from built-in commands", async () => {
   const { directory, launch } = await launchAgent(`
     const { createInterface } = require("node:readline");
