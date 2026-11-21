@@ -1338,6 +1338,109 @@ lines.on("line", (line) => {
     await connection.close();
   });
 
+  it("falls back to the loaded session model and thinking when resuming with retired IDs", async () => {
+    const setConfigCalls: Array<{ configId: string; value: string | boolean }> = [];
+    const configOptions = [
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "current-model",
+        options: [
+          { name: "Current Model", value: "current-model" },
+          { name: "Other Model", value: "other-model" },
+        ],
+      },
+      {
+        id: "thought_level",
+        name: "Thinking",
+        category: "thought_level",
+        type: "select",
+        currentValue: "medium",
+        options: [
+          { name: "Low", value: "low" },
+          { name: "Medium", value: "medium" },
+        ],
+      },
+    ];
+    const harness = connectorHarness({
+      capabilities: { loadSession: true },
+      configOptions,
+      handleRequest(instance, request) {
+        if (request.method !== "session/set_config_option") return false;
+        const params = request.params as { configId: string; value: string | boolean };
+        setConfigCalls.push(params);
+        if (params.configId === "model" && params.value === "retired-model") {
+          instance.reject(request, "Unknown model ID: retired-model");
+          return true;
+        }
+        return false;
+      },
+    });
+    const registration = runAcpProvider({
+      id: "retired-model-acp",
+      label: "Retired Model ACP",
+      connector: harness.connector,
+    });
+    const connection = await registration.connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.persistence", "session.configure"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    try {
+      await connection.send({
+        ...openInput(),
+        requestId: "resume-retired",
+        sessionId: "resumed-1",
+        persistence: { version: 1, data: { sessionId: "native-saved" } },
+        config: {
+          ...openInput().config,
+          model: "retired-model",
+          thinkingOption: "retired-effort",
+        },
+      });
+      await waitForEvent(
+        events,
+        (event) => event.type === "session.ready" && event.requestId === "resume-retired",
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "session.config",
+          sessionId: "resumed-1",
+          config: expect.objectContaining({
+            model: "current-model",
+            thinkingOption: "medium",
+          }),
+        }),
+      );
+      expect(setConfigCalls).toEqual([]);
+
+      // New (non-resumed) sessions still reject unknown models explicitly.
+      await connection.send({
+        ...openInput(),
+        requestId: "new-invalid",
+        sessionId: "fresh-1",
+        config: {
+          ...openInput().config,
+          model: "retired-model",
+        },
+      });
+      const failed = await waitForEvent(
+        events,
+        (event) => event.type === "request.failed" && event.requestId === "new-invalid",
+      );
+      expect(failed).toMatchObject({
+        type: "request.failed",
+        requestId: "new-invalid",
+        error: { message: expect.stringContaining("Unknown model ID") },
+      });
+    } finally {
+      await connection.close();
+    }
+  });
+
   it("does not claim exact permission policy, listing, image, or configuration support", async () => {
     const executable = await fakeAcp(basicAgent);
     const { connection, events } = await connect(executable, [
