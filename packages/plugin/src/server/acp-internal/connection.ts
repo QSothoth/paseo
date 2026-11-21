@@ -651,6 +651,7 @@ class AcpRuntime {
       nativeSessionId ??= prepared?.sessionId ?? null;
       Object.assign(metadata, prepared?.metadata);
     }
+    const isResumed = nativeSessionId !== null;
     let response: Pick<NewSessionResponse, "modes" | "configOptions">;
     if (nativeSessionId) {
       // ACP agents replay the loaded session's updates before session/load resolves,
@@ -680,7 +681,7 @@ class AcpRuntime {
     }
     this.modes = response.modes ?? null;
     this.configOptions = response.configOptions ?? [];
-    await this.applyInitialConfig(input.config);
+    await this.applyInitialConfig(input.config, { isResumed });
     const sessionCapabilities = connectionCapabilities.filter(
       (capability) =>
         capability !== "session.configure" ||
@@ -1076,7 +1077,10 @@ class AcpRuntime {
     }
   }
 
-  private async applyInitialConfig(config: ProviderSessionConfig): Promise<void> {
+  private async applyInitialConfig(
+    config: ProviderSessionConfig,
+    options: { isResumed?: boolean } = {},
+  ): Promise<void> {
     const requested: AcpConfigChange[] = [];
     if (config.model) requested.push({ target: "model", value: config.model });
     const autoAcceptMode = this.options.options.acpOptions?.autoAcceptMode;
@@ -1088,7 +1092,12 @@ class AcpRuntime {
     for (const [id, value] of Object.entries(config.settings)) {
       requested.push({ target: "setting", id, value });
     }
-    for (const change of this.inAgentOrder(requested)) await this.applyConfigChange(change);
+    for (const change of this.inAgentOrder(requested)) {
+      await this.applyConfigChange(change, {
+        allowUnavailableFallback:
+          options.isResumed === true && (change.target === "model" || change.target === "thinking"),
+      });
+    }
   }
 
   // One option can reset another: choosing an fx provider also selects that provider's saved
@@ -1111,7 +1120,10 @@ class AcpRuntime {
     return modeOption(this.configOptions)?.id;
   }
 
-  private async applyConfigChange(change: AcpConfigChange): Promise<void> {
+  private async applyConfigChange(
+    change: AcpConfigChange,
+    options?: { allowUnavailableFallback?: boolean },
+  ): Promise<void> {
     const autoAcceptMode = this.options.options.acpOptions?.autoAcceptMode;
     if (
       change.target === "mode" &&
@@ -1140,7 +1152,23 @@ class AcpRuntime {
         return;
       }
     }
+    if (options?.allowUnavailableFallback && this.isUnavailableResumedOption(change)) {
+      return;
+    }
     await this.applyNativeConfigChange(change);
+  }
+
+  private isUnavailableResumedOption(change: AcpConfigChange): boolean {
+    if (change.target !== "model" && change.target !== "thinking") return false;
+    const configId = this.configIdFor(change);
+    if (!configId) return true;
+    const option = this.configOptions.find((candidate) => candidate.id === configId);
+    if (!option || option.type === "boolean") return false;
+    const available = selectOptions(option);
+    if (available.length === 0) return false;
+    return (
+      typeof change.value === "string" && !available.some((item) => item.value === change.value)
+    );
   }
 
   private async applyNativeConfigChange(change: AcpConfigChange): Promise<void> {
