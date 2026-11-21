@@ -86,6 +86,8 @@ async function readAgyVersion(
   return /\b\d+\.\d+\.\d+\S*/.exec(stdout)?.[0] ?? (firstLine || undefined);
 }
 
+const SCHEDULE_DEFER_MAX_SECONDS = 30;
+
 export function createAntigravityProvider(): ProviderRegistration {
   const provider = runAcpProvider({
     id: "antigravity",
@@ -101,7 +103,21 @@ export function createAntigravityProvider(): ProviderRegistration {
         keepsTurnOpen(toolCall) {
           const input = toolCall.input;
           if (typeof input === "object" && input !== null && !Array.isArray(input)) {
-            return input.IsDaemon !== true;
+            if (input.IsDaemon === true) return false;
+            if (toolCall.name === "schedule") {
+              if (
+                typeof input.CronExpression === "string" &&
+                input.CronExpression.trim().length > 0
+              ) {
+                return false;
+              }
+              if (
+                typeof input.DurationSeconds === "number" &&
+                input.DurationSeconds > SCHEDULE_DEFER_MAX_SECONDS
+              ) {
+                return false;
+              }
+            }
           }
           return true;
         },

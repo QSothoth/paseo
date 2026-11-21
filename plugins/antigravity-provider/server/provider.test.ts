@@ -652,3 +652,188 @@ it("keeps a turn open for backgrounded run_command calls but not IsDaemon comman
     await connection.close();
   }
 });
+
+it("completes turns immediately for recurring cron and long schedule timers but keeps short timers open", async () => {
+  const { directory, launch } = await launchAgent(`
+    const { createInterface } = require("node:readline");
+    const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+    let turn = 0;
+    createInterface({ input: process.stdin }).on("line", (line) => {
+      const { id, method, params } = JSON.parse(line);
+      switch (method) {
+        case "initialize":
+          send({ id, result: { protocolVersion: 1, agentCapabilities: {} } });
+          break;
+        case "session/new":
+          send({ id, result: { sessionId: "agy-session", configOptions: [
+            { id: "mode", name: "Mode", category: "mode", type: "select", currentValue: "default",
+              options: [{ value: "default", name: "Default" }] },
+          ] } });
+          break;
+        case "session/prompt":
+          turn += 1;
+          if (turn === 1) {
+            send({ method: "session/update", params: { sessionId: params.sessionId, update: {
+              sessionUpdate: "tool_call", toolCallId: "cron-1", name: "schedule",
+              title: "Recurring poll", status: "in_progress",
+              rawInput: { CronExpression: "*/5 * * * *", Prompt: "Check status" },
+            } } });
+            send({ id, result: { stopReason: "end_turn" } });
+          } else if (turn === 2) {
+            send({ method: "session/update", params: { sessionId: params.sessionId, update: {
+              sessionUpdate: "tool_call", toolCallId: "long-timer-1", name: "schedule",
+              title: "Long reminder", status: "in_progress",
+              rawInput: { DurationSeconds: 300, Prompt: "Remind later" },
+            } } });
+            send({ id, result: { stopReason: "end_turn" } });
+          } else {
+            send({ method: "session/update", params: { sessionId: params.sessionId, update: {
+              sessionUpdate: "tool_call", toolCallId: "short-timer-1", name: "schedule",
+              title: "Short wait", status: "in_progress",
+              rawInput: { DurationSeconds: 5, Prompt: "Quick wait" },
+            } } });
+            send({ id, result: { stopReason: "end_turn" } });
+            setTimeout(() => {
+              send({ method: "session/update", params: { sessionId: params.sessionId, update: {
+                sessionUpdate: "tool_call_update", toolCallId: "short-timer-1", status: "completed",
+              } } });
+              send({ method: "session/update", params: { sessionId: params.sessionId, update: {
+                sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Timer fired." },
+              } } });
+              send({ method: "session/update", params: { sessionId: params.sessionId, update: {
+                sessionUpdate: "usage_update", used: 60, size: 1000,
+              } } });
+            }, 80);
+          }
+          break;
+        case "session/close":
+          send({ id, result: {} });
+          break;
+      }
+    });
+  `);
+  const provider = createAntigravityProvider();
+  const connection = await provider.connect({
+    launch,
+    versions: [1],
+    capabilities: ["prompt.message"],
+  });
+  const events: ProviderEvent[] = [];
+  connection.onEvent((event) => events.push(event));
+  try {
+    await connection.send({
+      type: "session.open",
+      requestId: "open-sched",
+      sessionId: "agy-sched",
+      history: "skip",
+      config: {
+        cwd: directory,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: false,
+      },
+    });
+    await expect
+      .poll(() => events.find((event) => event.type === "session.ready"), { timeout: 3_000 })
+      .toBeDefined();
+
+    // Turn 1: non-daemon recurring CronExpression completes immediately on end_turn.
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "agy-sched",
+      prompt: {
+        clientMessageId: "cron-turn",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "poll every 5m" }] },
+      },
+    });
+    await expect
+      .poll(
+        () =>
+          events.find(
+            (event) =>
+              event.type === "session.turn" &&
+              event.turnId === "acp:cron-turn" &&
+              event.state === "completed",
+          ),
+        { timeout: 3_000 },
+      )
+      .toBeDefined();
+
+    // Turn 2: long one-shot timer (> 30s) completes immediately on end_turn.
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "agy-sched",
+      prompt: {
+        clientMessageId: "long-timer-turn",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "remind in 5m" }] },
+      },
+    });
+    await expect
+      .poll(
+        () =>
+          events.find(
+            (event) =>
+              event.type === "session.turn" &&
+              event.turnId === "acp:long-timer-turn" &&
+              event.state === "completed",
+          ),
+        { timeout: 3_000 },
+      )
+      .toBeDefined();
+
+    // Turn 3: short one-shot timer (<= 30s) stays deferred until completion + reply.
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "agy-sched",
+      prompt: {
+        clientMessageId: "short-timer-turn",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "wait 5s" }] },
+      },
+    });
+    await expect
+      .poll(
+        () =>
+          events.find(
+            (event) =>
+              event.type === "timeline.item" &&
+              event.item.type === "tool_call" &&
+              event.item.id === "short-timer-1" &&
+              event.item.status === "running",
+          ),
+        { timeout: 3_000 },
+      )
+      .toBeDefined();
+    expect(
+      events.some(
+        (event) =>
+          event.type === "session.turn" &&
+          event.turnId === "acp:short-timer-turn" &&
+          event.state === "completed",
+      ),
+    ).toBe(false);
+    await expect
+      .poll(
+        () =>
+          events.find(
+            (event) =>
+              event.type === "session.turn" &&
+              event.turnId === "acp:short-timer-turn" &&
+              event.state === "completed",
+          ),
+        { timeout: 3_000 },
+      )
+      .toBeDefined();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "timeline.item",
+        item: expect.objectContaining({ type: "assistant_message", text: "Timer fired." }),
+      }),
+    );
+  } finally {
+    await connection.close();
+  }
+});
