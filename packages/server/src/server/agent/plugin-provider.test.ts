@@ -3437,3 +3437,109 @@ test("bounds settings wait when Stop is queued behind an unanswered steer", asyn
     await plugins.shutdown();
   }
 });
+
+test("lazily connects command-backed plugin providers during AgentManager.listImportableSessions", async () => {
+  const logger = createTestLogger();
+  const cwd = tmpdir();
+  let listableConnects = 0;
+  let missingConnects = 0;
+  let noListConnects = 0;
+
+  const listableHarness = createProviderHarness({
+    capabilities: ["prompt.message", "session.list"],
+    handleInput: async (input, emit) => {
+      if (input.type !== "sessions") return false;
+      emit({
+        type: "sessions",
+        requestId: input.requestId,
+        sessions: [
+          {
+            persistence: { version: 1, data: { sessionId: "native-lazy-1" } },
+            cwd,
+            title: "Lazy listed session",
+            updatedAt: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+      });
+      return true;
+    },
+  });
+  const noListHarness = createProviderHarness({
+    capabilities: ["prompt.message"],
+  });
+
+  const listableRegistration: ProviderRegistration = {
+    ...listableHarness.registration,
+    id: "lazy-listable",
+    label: "Lazy Listable",
+    command: [process.execPath, "-e", ""],
+    async status() {
+      return { available: true };
+    },
+    async connect(request) {
+      listableConnects += 1;
+      return listableHarness.registration.connect(request);
+    },
+  };
+  const missingRegistration: ProviderRegistration = {
+    id: "lazy-missing",
+    label: "Lazy Missing",
+    command: [join(cwd, `paseo-missing-binary-${process.pid}`)],
+    async connect() {
+      missingConnects += 1;
+      throw new Error("should not connect when executable is missing");
+    },
+  };
+  const noListRegistration: ProviderRegistration = {
+    ...noListHarness.registration,
+    id: "lazy-no-list",
+    label: "Lazy No List",
+    command: [process.execPath, "-e", ""],
+    async connect(request) {
+      noListConnects += 1;
+      return noListHarness.registration.connect(request);
+    },
+  };
+
+  const plugins = new PluginAgentClientRegistry(logger);
+  plugins.replace([listableRegistration, missingRegistration, noListRegistration]);
+  const registry = buildProviderRegistry(logger, { pluginProviders: plugins.definitions() });
+  const clients = {
+    "lazy-listable": registry["lazy-listable"]!.createClient(logger),
+    "lazy-missing": registry["lazy-missing"]!.createClient(logger),
+    "lazy-no-list": registry["lazy-no-list"]!.createClient(logger),
+  };
+  const manager = new AgentManager({
+    logger,
+    clients,
+    providerDefinitions: {
+      "lazy-listable": registry["lazy-listable"]!,
+      "lazy-missing": registry["lazy-missing"]!,
+      "lazy-no-list": registry["lazy-no-list"]!,
+    },
+  });
+
+  try {
+    expect(clients["lazy-listable"].capabilities.supportsSessionListing).toBe(true);
+    expect(clients["lazy-no-list"].capabilities.supportsSessionListing).toBe(true);
+    expect(listableConnects).toBe(0);
+    expect(noListConnects).toBe(0);
+
+    const listing = await manager.listImportableSessions({ limit: 20 });
+    expect(listing.providerErrors).toEqual([]);
+    expect(listing.sessions).toEqual([
+      expect.objectContaining({
+        provider: "lazy-listable",
+        cwd,
+        title: "Lazy listed session",
+      }),
+    ]);
+    expect(listableConnects).toBe(1);
+    expect(missingConnects).toBe(0);
+    expect(noListConnects).toBe(1);
+    expect(clients["lazy-listable"].capabilities.supportsSessionListing).toBe(true);
+    expect(clients["lazy-no-list"].capabilities.supportsSessionListing).toBe(false);
+  } finally {
+    await plugins.shutdown();
+  }
+});
