@@ -245,6 +245,10 @@ class ProviderRuntime {
     return callback({ ...options, launch: await this.resolveLaunch() });
   }
 
+  get hasNegotiatedCapabilities(): boolean {
+    return this.connection !== null;
+  }
+
   get negotiatedCapabilities(): readonly string[] {
     return this.connection?.capabilities ?? [];
   }
@@ -273,6 +277,10 @@ class ProviderRuntime {
       limit?: number;
     } = {},
   ): Promise<Extract<ProviderEvent, { type: "sessions" }>["sessions"]> {
+    if (!this.connection && this.registration.command) {
+      const launch = await this.resolveEffectiveLaunch();
+      if (launch && !launch.resolved) return [];
+    }
     const connection = await this.getConnection();
     if (!connection.capabilities.includes("session.list")) return [];
     const event = await this.complete({ type: "sessions", requestId: randomUUID(), ...input });
@@ -1048,7 +1056,9 @@ class PluginAgentClient implements AgentClient {
   }
 
   get capabilities(): AgentCapabilityFlags {
-    return agentCapabilities(this.runtime.negotiatedCapabilities);
+    return agentCapabilities(this.runtime.negotiatedCapabilities, {
+      lazySessionListing: !this.runtime.hasNegotiatedCapabilities && !this.runtime.isClosed,
+    });
   }
 
   async createSession(
@@ -2001,12 +2011,15 @@ class PluginAgentSession implements AgentSession {
   }
 }
 
-function agentCapabilities(capabilities: readonly string[]): AgentCapabilityFlags {
+function agentCapabilities(
+  capabilities: readonly string[],
+  options?: { lazySessionListing?: boolean },
+): AgentCapabilityFlags {
   const supports = (capability: ProviderCapability) => capabilities.includes(capability);
   return {
     supportsStreaming: true,
     supportsSessionPersistence: supports("session.persistence"),
-    supportsSessionListing: supports("session.list"),
+    supportsSessionListing: options?.lazySessionListing === true || supports("session.list"),
     supportsDynamicModes: supports("session.configure"),
     supportsMcpServers: true,
     supportsNativePaseoTools: false,

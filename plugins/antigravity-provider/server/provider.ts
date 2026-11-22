@@ -1,9 +1,12 @@
+import { createHash } from "node:crypto";
 import { execCommand } from "@getpaseo/plugin/server";
 import { runAcpProvider, type AcpTransformer } from "@getpaseo/plugin/server/acp";
 import {
   PROVIDER_PROTOCOL_VERSION,
   type ProviderInstallationLaunch,
+  type ProviderLaunch,
   type ProviderRegistration,
+  type ProviderStatus,
 } from "@getpaseo/plugin/server/provider";
 import { z } from "zod";
 import { mapToolCall } from "./tool-calls.js";
@@ -86,7 +89,24 @@ async function readAgyVersion(
   return /\b\d+\.\d+\.\d+\S*/.exec(stdout)?.[0] ?? (firstLine || undefined);
 }
 
+const SCHEDULE_DEFER_MAX_SECONDS = 30;
+const ACP_STARTUP_TIMEOUT_MS = 30_000;
+const STATUS_SUCCESS_CACHE_TTL_MS = 30_000;
+const STATUS_FAILURE_CACHE_TTL_MS = 5_000;
+const STATUS_CACHE_MAX_ENTRIES = 8;
+
+function statusCacheKey(launch: ProviderLaunch): string {
+  const envEntries = Object.keys(launch.env)
+    .sort()
+    .map((key) => [key, launch.env[key]]);
+  return createHash("sha256")
+    .update(JSON.stringify([launch.command, launch.args, envEntries]))
+    .digest("hex");
+}
+
 export function createAntigravityProvider(): ProviderRegistration {
+  const statusCache = new Map<string, { expiresAt: number; status: ProviderStatus }>();
+  const statusInFlight = new Map<string, Promise<ProviderStatus>>();
   const provider = runAcpProvider({
     id: "antigravity",
     label: "Antigravity",
@@ -94,6 +114,7 @@ export function createAntigravityProvider(): ProviderRegistration {
     icon: "icon.svg",
     command: ["agy", "acp", "--disable-telemetry"],
     acpOptions: {
+      startupTimeoutMs: ACP_STARTUP_TIMEOUT_MS,
       waitForInitialCommands: true,
       loadReplayQuietPeriodMs: 200,
       // COMPAT(antigravityAcpV1DeferredTurn): added in v0.18.0, remove once Antigravity CLI supports ACP v2 state_update.
@@ -101,7 +122,21 @@ export function createAntigravityProvider(): ProviderRegistration {
         keepsTurnOpen(toolCall) {
           const input = toolCall.input;
           if (typeof input === "object" && input !== null && !Array.isArray(input)) {
-            return input.IsDaemon !== true;
+            if (input.IsDaemon === true) return false;
+            if (toolCall.name === "schedule") {
+              if (
+                typeof input.CronExpression === "string" &&
+                input.CronExpression.trim().length > 0
+              ) {
+                return false;
+              }
+              if (
+                typeof input.DurationSeconds === "number" &&
+                input.DurationSeconds > SCHEDULE_DEFER_MAX_SECONDS
+              ) {
+                return false;
+              }
+            }
           }
           return true;
         },
@@ -133,20 +168,43 @@ export function createAntigravityProvider(): ProviderRegistration {
     },
     async status({ launch }) {
       if (!launch) return { available: false, diagnostic: "Install Antigravity 1.5.0 or later." };
+      const key = statusCacheKey(launch);
+      const cached = statusCache.get(key);
+      if (cached && cached.expiresAt > Date.now()) return cached.status;
+      const existing = statusInFlight.get(key);
+      if (existing) return existing;
+      const probe = (async (): Promise<ProviderStatus> => {
+        let result: ProviderStatus;
+        try {
+          const connection = await provider.connect({
+            launch,
+            versions: [PROVIDER_PROTOCOL_VERSION],
+            capabilities: [],
+          });
+          await connection.close();
+          result = { available: true };
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const base =
+            "Antigravity ACP did not start. Install Antigravity 1.5.0 or later. If you override the command, include the acp subcommand.";
+          result = {
+            available: false,
+            diagnostic: detail ? `${base} (${detail})` : base,
+          };
+        }
+        const ttlMs = result.available ? STATUS_SUCCESS_CACHE_TTL_MS : STATUS_FAILURE_CACHE_TTL_MS;
+        if (statusCache.size >= STATUS_CACHE_MAX_ENTRIES && !statusCache.has(key)) {
+          const oldestKey = statusCache.keys().next().value;
+          if (oldestKey !== undefined) statusCache.delete(oldestKey);
+        }
+        statusCache.set(key, { expiresAt: Date.now() + ttlMs, status: result });
+        return result;
+      })();
+      statusInFlight.set(key, probe);
       try {
-        const connection = await provider.connect({
-          launch,
-          versions: [PROVIDER_PROTOCOL_VERSION],
-          capabilities: [],
-        });
-        await connection.close();
-        return { available: true };
-      } catch {
-        return {
-          available: false,
-          diagnostic:
-            "Antigravity ACP did not start. Install Antigravity 1.5.0 or later. If you override the command, include the acp subcommand.",
-        };
+        return await probe;
+      } finally {
+        if (statusInFlight.get(key) === probe) statusInFlight.delete(key);
       }
     },
   };

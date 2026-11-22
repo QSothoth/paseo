@@ -1,4 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { basename } from "node:path";
 import { spawnProcess, terminateProcess } from "../process.js";
 import { Readable, Writable } from "node:stream";
 import {
@@ -283,6 +284,18 @@ async function discover(
   }
 }
 
+const MAX_SESSION_LIST_SCAN = 500;
+
+function matchesSessionQuery(
+  session: { title?: string | null; cwd: string },
+  rawQuery: string | undefined,
+): boolean {
+  const query = rawQuery?.trim().toLowerCase();
+  if (!query) return true;
+  const cwdBasename = basename(session.cwd.replaceAll("\\", "/"));
+  return [session.title, cwdBasename].some((value) => value?.toLowerCase().includes(query));
+}
+
 async function listSessions(
   input: Extract<ProviderInput, { type: "sessions" }>,
   state: AcpConnectionState,
@@ -295,17 +308,38 @@ async function listSessions(
     emit: state.emit,
   });
   try {
-    const response = await runtime.listSessions(input.cwd);
-    const selected = input.limit ? response.sessions.slice(0, input.limit) : response.sessions;
+    const limit = input.limit ?? Number.POSITIVE_INFINITY;
+    const selected: Array<{
+      persistence: ProviderPersistence;
+      cwd: string;
+      title?: string;
+      updatedAt?: string;
+    }> = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    let scanned = 0;
+    while (selected.length < limit && scanned < MAX_SESSION_LIST_SCAN) {
+      const response = await runtime.listSessions(input.cwd, cursor);
+      for (const session of response.sessions) {
+        if (scanned >= MAX_SESSION_LIST_SCAN || selected.length >= limit) break;
+        scanned += 1;
+        if (!matchesSessionQuery(session, input.query)) continue;
+        selected.push({
+          persistence: nativePersistence(session.sessionId),
+          cwd: session.cwd,
+          title: session.title ?? undefined,
+          updatedAt: session.updatedAt ?? undefined,
+        });
+      }
+      const nextCursor = response.nextCursor ?? undefined;
+      if (!nextCursor || seenCursors.has(nextCursor)) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
     state.emit({
       type: "sessions",
       requestId: input.requestId,
-      sessions: selected.map((session) => ({
-        persistence: nativePersistence(session.sessionId),
-        cwd: session.cwd,
-        title: session.title ?? undefined,
-        updatedAt: session.updatedAt ?? undefined,
-      })),
+      sessions: selected,
     });
   } finally {
     await runtime.close();
@@ -617,6 +651,7 @@ class AcpRuntime {
       nativeSessionId ??= prepared?.sessionId ?? null;
       Object.assign(metadata, prepared?.metadata);
     }
+    const isResumed = nativeSessionId !== null;
     let response: Pick<NewSessionResponse, "modes" | "configOptions">;
     if (nativeSessionId) {
       // ACP agents replay the loaded session's updates before session/load resolves,
@@ -646,7 +681,7 @@ class AcpRuntime {
     }
     this.modes = response.modes ?? null;
     this.configOptions = response.configOptions ?? [];
-    await this.applyInitialConfig(input.config);
+    await this.applyInitialConfig(input.config, { isResumed });
     const sessionCapabilities = connectionCapabilities.filter(
       (capability) =>
         capability !== "session.configure" ||
@@ -885,8 +920,13 @@ class AcpRuntime {
     return true;
   }
 
-  listSessions(cwd?: string) {
-    return this.call(this.connection.listSessions({ cwd }));
+  listSessions(cwd?: string, cursor?: string) {
+    return this.call(
+      this.connection.listSessions({
+        ...(cwd !== undefined ? { cwd } : {}),
+        ...(cursor !== undefined ? { cursor } : {}),
+      }),
+    );
   }
 
   async drainNotifications(): Promise<void> {
@@ -1037,7 +1077,10 @@ class AcpRuntime {
     }
   }
 
-  private async applyInitialConfig(config: ProviderSessionConfig): Promise<void> {
+  private async applyInitialConfig(
+    config: ProviderSessionConfig,
+    options: { isResumed?: boolean } = {},
+  ): Promise<void> {
     const requested: AcpConfigChange[] = [];
     if (config.model) requested.push({ target: "model", value: config.model });
     const autoAcceptMode = this.options.options.acpOptions?.autoAcceptMode;
@@ -1049,7 +1092,12 @@ class AcpRuntime {
     for (const [id, value] of Object.entries(config.settings)) {
       requested.push({ target: "setting", id, value });
     }
-    for (const change of this.inAgentOrder(requested)) await this.applyConfigChange(change);
+    for (const change of this.inAgentOrder(requested)) {
+      await this.applyConfigChange(change, {
+        allowUnavailableFallback:
+          options.isResumed === true && (change.target === "model" || change.target === "thinking"),
+      });
+    }
   }
 
   // One option can reset another: choosing an fx provider also selects that provider's saved
@@ -1072,7 +1120,10 @@ class AcpRuntime {
     return modeOption(this.configOptions)?.id;
   }
 
-  private async applyConfigChange(change: AcpConfigChange): Promise<void> {
+  private async applyConfigChange(
+    change: AcpConfigChange,
+    options?: { allowUnavailableFallback?: boolean },
+  ): Promise<void> {
     const autoAcceptMode = this.options.options.acpOptions?.autoAcceptMode;
     if (
       change.target === "mode" &&
@@ -1101,7 +1152,23 @@ class AcpRuntime {
         return;
       }
     }
+    if (options?.allowUnavailableFallback && this.isUnavailableResumedOption(change)) {
+      return;
+    }
     await this.applyNativeConfigChange(change);
+  }
+
+  private isUnavailableResumedOption(change: AcpConfigChange): boolean {
+    if (change.target !== "model" && change.target !== "thinking") return false;
+    const configId = this.configIdFor(change);
+    if (!configId) return true;
+    const option = this.configOptions.find((candidate) => candidate.id === configId);
+    if (!option || option.type === "boolean") return false;
+    const available = selectOptions(option);
+    if (available.length === 0) return false;
+    return (
+      typeof change.value === "string" && !available.some((item) => item.value === change.value)
+    );
   }
 
   private async applyNativeConfigChange(change: AcpConfigChange): Promise<void> {

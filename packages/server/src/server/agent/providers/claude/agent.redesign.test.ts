@@ -167,12 +167,19 @@ async function collectUntilTerminal(
   return events;
 }
 
+let getuidSpy: ReturnType<typeof vi.spyOn> | null = null;
+
 beforeEach(() => {
   sdkQueryFactory.mockReset();
+  if (typeof process.getuid === "function") {
+    getuidSpy = vi.spyOn(process, "getuid").mockReturnValue(1000);
+  }
 });
 
 afterEach(() => {
   sdkQueryFactory.mockReset();
+  getuidSpy?.mockRestore();
+  getuidSpy = null;
 });
 
 test("exposes and applies auto permission mode", async () => {
@@ -1097,6 +1104,46 @@ test("preserves bypass capability across query restarts triggered by thinking ch
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       effort: "high",
+    });
+  } finally {
+    await session.close();
+  }
+});
+
+test("disables bypass launch capability and normalizes bypassPermissions to auto under root", async () => {
+  if (typeof process.getuid !== "function") return;
+  getuidSpy?.mockReturnValue(0);
+  const capturedOptions: Array<{
+    permissionMode?: string;
+    allowDangerouslySkipPermissions?: boolean;
+  }> = [];
+
+  sdkQueryFactory.mockImplementation(
+    ({
+      options,
+    }: {
+      options: {
+        permissionMode?: string;
+        allowDangerouslySkipPermissions?: boolean;
+      };
+    }) => {
+      capturedOptions.push({
+        permissionMode: options.permissionMode,
+        allowDangerouslySkipPermissions: options.allowDangerouslySkipPermissions,
+      });
+      return createBaseQueryMock(vi.fn(async () => ({ done: true, value: undefined })));
+    },
+  );
+
+  const session = await createSession();
+
+  try {
+    await session.setMode("bypassPermissions");
+    expect(await session.getCurrentMode()).toBe("auto");
+    expect(capturedOptions).toHaveLength(1);
+    expect(capturedOptions[0]).toMatchObject({
+      permissionMode: "auto",
+      allowDangerouslySkipPermissions: false,
     });
   } finally {
     await session.close();

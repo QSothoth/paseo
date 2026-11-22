@@ -950,6 +950,127 @@ lines.on("line", (line) => {
     }
   });
 
+  it("filters ACP listed sessions by query across nextCursor pages before applying limit", async () => {
+    const requestedCursors: Array<string | undefined> = [];
+    const harness = connectorHarness({
+      capabilities: { sessionCapabilities: { list: {} } },
+      handleRequest(instance, request) {
+        if (request.method !== "session/list") return false;
+        const params = (request.params ?? {}) as { cursor?: string; cwd?: string };
+        requestedCursors.push(params.cursor);
+        if (!params.cursor) {
+          instance.respond(request, {
+            sessions: [
+              { sessionId: "s-1", cwd: "/work/alpha", title: "Alpha task" },
+              { sessionId: "s-2", cwd: "/work/beta", title: "Beta task" },
+            ],
+            nextCursor: "page-2",
+          });
+        } else if (params.cursor === "page-2") {
+          instance.respond(request, {
+            sessions: [
+              { sessionId: "s-3", cwd: "/work/gamma", title: "Needle title match" },
+              { sessionId: "s-4", cwd: "/work/needle-repo", title: "Repo basename match" },
+              { sessionId: "s-5", cwd: "/work/delta", title: "Needle third match" },
+            ],
+            nextCursor: "page-3",
+          });
+        } else {
+          instance.respond(request, {
+            sessions: [{ sessionId: "s-6", cwd: "/work/needle-late", title: "Should not fetch" }],
+            nextCursor: null,
+          });
+        }
+        return true;
+      },
+    });
+    const registration = runAcpProvider({
+      id: "paged-list-acp",
+      label: "Paged List ACP",
+      connector: harness.connector,
+    });
+    const connection = await registration.connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.list"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    try {
+      await connection.send({
+        type: "sessions",
+        requestId: "paged-query",
+        query: "needle",
+        limit: 2,
+      });
+      const listed = await waitForEvent(
+        events,
+        (event) => event.type === "sessions" && event.requestId === "paged-query",
+      );
+      expect(listed).toMatchObject({
+        type: "sessions",
+        sessions: [
+          {
+            persistence: { version: 1, data: { sessionId: "s-3" } },
+            cwd: "/work/gamma",
+            title: "Needle title match",
+          },
+          {
+            persistence: { version: 1, data: { sessionId: "s-4" } },
+            cwd: "/work/needle-repo",
+            title: "Repo basename match",
+          },
+        ],
+      });
+      expect(requestedCursors).toEqual([undefined, "page-2"]);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("stops ACP session pagination if an agent repeats a nextCursor", async () => {
+    let calls = 0;
+    const harness = connectorHarness({
+      capabilities: { sessionCapabilities: { list: {} } },
+      handleRequest(instance, request) {
+        if (request.method !== "session/list") return false;
+        calls += 1;
+        instance.respond(request, {
+          sessions: [{ sessionId: `s-${calls}`, cwd: "/work/app", title: `Page ${calls}` }],
+          nextCursor: "same-cursor",
+        });
+        return true;
+      },
+    });
+    const registration = runAcpProvider({
+      id: "loop-list-acp",
+      label: "Loop List ACP",
+      connector: harness.connector,
+    });
+    const connection = await registration.connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.list"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    try {
+      await connection.send({ type: "sessions", requestId: "loop-query", limit: 10 });
+      const listed = await waitForEvent(
+        events,
+        (event) => event.type === "sessions" && event.requestId === "loop-query",
+      );
+      expect(listed).toMatchObject({
+        type: "sessions",
+        sessions: [
+          { persistence: { version: 1, data: { sessionId: "s-1" } } },
+          { persistence: { version: 1, data: { sessionId: "s-2" } } },
+        ],
+      });
+      expect(calls).toBe(2);
+    } finally {
+      await connection.close();
+    }
+  });
+
   it("still reports initialization failures for workspace-only global discovery", async () => {
     let unavailable = false;
     const { connector } = connectorHarness({
@@ -1708,6 +1829,109 @@ lines.on("line", (line) => {
     ).toEqual(["configure-first", "configure-second"]);
 
     await connection.close();
+  });
+
+  it("falls back to the loaded session model and thinking when resuming with retired IDs", async () => {
+    const setConfigCalls: Array<{ configId: string; value: string | boolean }> = [];
+    const configOptions = [
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "current-model",
+        options: [
+          { name: "Current Model", value: "current-model" },
+          { name: "Other Model", value: "other-model" },
+        ],
+      },
+      {
+        id: "thought_level",
+        name: "Thinking",
+        category: "thought_level",
+        type: "select",
+        currentValue: "medium",
+        options: [
+          { name: "Low", value: "low" },
+          { name: "Medium", value: "medium" },
+        ],
+      },
+    ];
+    const harness = connectorHarness({
+      capabilities: { loadSession: true },
+      configOptions,
+      handleRequest(instance, request) {
+        if (request.method !== "session/set_config_option") return false;
+        const params = request.params as { configId: string; value: string | boolean };
+        setConfigCalls.push(params);
+        if (params.configId === "model" && params.value === "retired-model") {
+          instance.reject(request, "Unknown model ID: retired-model");
+          return true;
+        }
+        return false;
+      },
+    });
+    const registration = runAcpProvider({
+      id: "retired-model-acp",
+      label: "Retired Model ACP",
+      connector: harness.connector,
+    });
+    const connection = await registration.connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.persistence", "session.configure"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    try {
+      await connection.send({
+        ...openInput(),
+        requestId: "resume-retired",
+        sessionId: "resumed-1",
+        persistence: { version: 1, data: { sessionId: "native-saved" } },
+        config: {
+          ...openInput().config,
+          model: "retired-model",
+          thinkingOption: "retired-effort",
+        },
+      });
+      await waitForEvent(
+        events,
+        (event) => event.type === "session.ready" && event.requestId === "resume-retired",
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "session.config",
+          sessionId: "resumed-1",
+          config: expect.objectContaining({
+            model: "current-model",
+            thinkingOption: "medium",
+          }),
+        }),
+      );
+      expect(setConfigCalls).toEqual([]);
+
+      // New (non-resumed) sessions still reject unknown models explicitly.
+      await connection.send({
+        ...openInput(),
+        requestId: "new-invalid",
+        sessionId: "fresh-1",
+        config: {
+          ...openInput().config,
+          model: "retired-model",
+        },
+      });
+      const failed = await waitForEvent(
+        events,
+        (event) => event.type === "request.failed" && event.requestId === "new-invalid",
+      );
+      expect(failed).toMatchObject({
+        type: "request.failed",
+        requestId: "new-invalid",
+        error: { message: expect.stringContaining("Unknown model ID") },
+      });
+    } finally {
+      await connection.close();
+    }
   });
 
   it("does not claim exact permission policy, listing, image, or configuration support", async () => {
