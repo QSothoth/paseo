@@ -43,7 +43,17 @@ function formatCreateConfigParentSource(parent: AgentCreateConfigParent): string
 export function resolveAndValidateCreateAgentMode(
   input: ResolveCreateAgentModeInput,
 ): string | undefined {
-  const { requestedMode, targetProvider, parent, availableModes } = input;
+  const { targetProvider, parent, availableModes } = input;
+  const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+  let requestedMode = input.requestedMode;
+  if (
+    isRoot &&
+    targetProvider === "claude" &&
+    (requestedMode === "bypassPermissions" || requestedMode === "bypass")
+  ) {
+    requestedMode =
+      availableModes === undefined || availableModes.includes("auto") ? "auto" : "acceptEdits";
+  }
 
   if (requestedMode !== undefined) {
     if (availableModes !== undefined && !availableModes.includes(requestedMode)) {

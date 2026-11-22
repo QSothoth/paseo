@@ -1077,14 +1077,49 @@ function assertClaudeModeCanRun(mode: PermissionMode, env: NodeJS.ProcessEnv): v
   );
 }
 
+function isRunningAsRoot(): boolean {
+  return typeof process.getuid === "function" && process.getuid() === 0;
+}
+
+function normalizeClaudeModeForHost(mode: PermissionMode, env: NodeJS.ProcessEnv): PermissionMode {
+  if (mode === "bypassPermissions" && isRunningAsRoot()) {
+    return claudeAutoModeUnavailableOn(env) ? "acceptEdits" : "auto";
+  }
+  return mode;
+}
+
+function stripRootBypassExtraArgs(
+  extraArgs: Record<string, string | null> | undefined,
+): Record<string, string | null> | undefined {
+  if (!extraArgs) {
+    return extraArgs;
+  }
+  const filtered: Record<string, string | null> = {};
+  for (const [key, value] of Object.entries(extraArgs)) {
+    const flag = key.replace(/^--?/, "");
+    if (
+      flag === "dangerously-skip-permissions" ||
+      flag === "allow-dangerously-skip-permissions" ||
+      (flag === "permission-mode" && value === "bypassPermissions")
+    ) {
+      continue;
+    }
+    filtered[key] = value;
+  }
+  return filtered;
+}
+
 function claudeModeCatalog(env: NodeJS.ProcessEnv): {
   modes: AgentMode[];
   defaultModeId: PermissionMode;
 } {
+  const rootFiltered = isRunningAsRoot()
+    ? DEFAULT_MODES.filter((mode) => mode.id !== "bypassPermissions")
+    : DEFAULT_MODES;
   if (claudeAutoModeUnavailableOn(env)) {
-    return { modes: DEFAULT_MODES.filter((mode) => mode.id !== "auto"), defaultModeId: "default" };
+    return { modes: rootFiltered.filter((mode) => mode.id !== "auto"), defaultModeId: "default" };
   }
-  return { modes: DEFAULT_MODES, defaultModeId: "auto" };
+  return { modes: rootFiltered, defaultModeId: "auto" };
 }
 
 function coerceSessionMetadata(metadata: AgentMetadata | undefined): Partial<AgentSessionConfig> {
@@ -2609,7 +2644,10 @@ class ClaudeAgentSession implements AgentSession {
       );
     }
 
-    this.currentMode = isPermissionMode(config.modeId) ? config.modeId : "default";
+    this.currentMode = normalizeClaudeModeForHost(
+      isPermissionMode(config.modeId) ? config.modeId : "default",
+      this.harnessEnvironment,
+    );
     if (this.currentMode !== "plan") {
       this.planResumeMode = this.currentMode;
     }
@@ -2944,7 +2982,10 @@ class ClaudeAgentSession implements AgentSession {
       );
     }
 
-    const normalized = isPermissionMode(modeId) ? modeId : "default";
+    const normalized = normalizeClaudeModeForHost(
+      isPermissionMode(modeId) ? modeId : "default",
+      this.harnessEnvironment,
+    );
     assertClaudeModeCanRun(normalized, this.harnessEnvironment);
     const previousMode = this.currentMode;
     const previousQuery = this.query;
@@ -4004,7 +4045,9 @@ class ClaudeAgentSession implements AgentSession {
     const providerOptions = applyClaudeToolPolicy(sdkProviderOptions, this.config.toolPolicy);
     const settingsOptions = await this.buildSettingsOptions(providerOptions);
     const sdkEnv = this.harnessEnvironment;
-    assertClaudeModeCanRun(permissionMode, sdkEnv);
+    const isRoot = isRunningAsRoot();
+    const effectivePermissionMode = normalizeClaudeModeForHost(permissionMode, sdkEnv);
+    assertClaudeModeCanRun(effectivePermissionMode, sdkEnv);
 
     const claudeBinary = await this.resolveBinary();
     this.logger.debug(
@@ -4027,11 +4070,12 @@ class ClaudeAgentSession implements AgentSession {
     const base: ClaudeOptions = {
       cwd: this.config.cwd,
       includePartialMessages: true,
-      permissionMode,
+      permissionMode: effectivePermissionMode,
       // Dynamic mode switching can recreate the underlying Claude query. Keep the
-      // bypass launch capability available so later setPermissionMode("bypassPermissions")
-      // calls do not fail after a model/thinking/rewind-driven restart.
-      allowDangerouslySkipPermissions: true,
+      // bypass launch capability available for non-root hosts so later
+      // setPermissionMode("bypassPermissions") calls do not fail after a restart.
+      // Claude Code refuses --allow-dangerously-skip-permissions under root (uid 0).
+      allowDangerouslySkipPermissions: !isRoot,
       agents: this.defaults?.agents,
       canUseTool: this.handlePermissionRequest,
       pathToClaudeCodeExecutable: claudeBinary,
@@ -4077,6 +4121,9 @@ class ClaudeAgentSession implements AgentSession {
     this.lastOptionsModel = base.model ?? null;
     if (this.claudeSessionId && !this.pendingFreshSessionId) {
       base.resume = this.claudeSessionId;
+    }
+    if (isRoot && base.extraArgs) {
+      base.extraArgs = stripRootBypassExtraArgs(base.extraArgs);
     }
     if (this.runtimeSettings?.disallowedTools?.length) {
       base.disallowedTools = [
