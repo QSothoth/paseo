@@ -3680,3 +3680,33 @@ test("bounds settings wait when Stop is queued behind an unanswered steer", asyn
     await plugins.shutdown();
   }
 });
+
+test("forwards force refresh intent to plugin provider status() from isAvailable() and getDiagnostic()", async () => {
+  const logger = createTestLogger();
+  const seenForce: Array<boolean | undefined> = [];
+  const harness = createProviderHarness();
+  const registration: ProviderRegistration = {
+    ...harness.registration,
+    id: "force-status-provider",
+    label: "Force Status Provider",
+    async status(request) {
+      seenForce.push(request.force);
+      return { available: true };
+    },
+  };
+  const plugins = new PluginAgentClientRegistry(logger);
+  plugins.replace([registration]);
+  const client = plugins.clients()["force-status-provider"]!;
+  try {
+    await expect(client.isAvailable(undefined, { scope: "global", force: false })).resolves.toBe(
+      true,
+    );
+    await expect(client.isAvailable(undefined, { scope: "global", force: true })).resolves.toBe(
+      true,
+    );
+    await client.getDiagnostic?.({ inspectInstallation: async () => null });
+    expect(seenForce).toEqual([undefined, true, true]);
+  } finally {
+    await plugins.shutdown();
+  }
+});

@@ -5,6 +5,7 @@ import {
   ClientSideConnection,
   CLIENT_METHODS,
   PROTOCOL_VERSION,
+  RequestError,
   ndJsonStream,
   type Client,
   type AgentCapabilities,
@@ -69,6 +70,30 @@ interface AcpBoundarySession {
   runtime: AcpRuntime;
   capabilities: readonly ProviderCapability[];
   mutationLane: Promise<void>;
+}
+
+export type AcpStartupFailureReason = "timeout" | "closed" | "spawn";
+
+export class AcpStartupError extends Error {
+  readonly reason: AcpStartupFailureReason;
+  readonly timeoutMs?: number;
+  readonly code?: string;
+
+  constructor(
+    message: string,
+    options: {
+      reason: AcpStartupFailureReason;
+      timeoutMs?: number;
+      code?: string;
+      cause?: unknown;
+    },
+  ) {
+    super(message, { cause: options.cause });
+    this.name = "AcpStartupError";
+    this.reason = options.reason;
+    this.timeoutMs = options.timeoutMs;
+    this.code = options.code;
+  }
 }
 
 export async function createAcpProviderConnection(
@@ -502,7 +527,17 @@ class AcpRuntime {
         env: { ...launch.env, ...options.env },
         stdio: "pipe",
       });
-      spawnFailure = new Promise<never>((_resolve, reject) => child!.once("error", reject));
+      spawnFailure = new Promise<never>((_resolve, reject) =>
+        child!.once("error", (error: NodeJS.ErrnoException) => {
+          reject(
+            new AcpStartupError(error.message, {
+              reason: "spawn",
+              code: typeof error.code === "string" ? error.code : undefined,
+              cause: error,
+            }),
+          );
+        }),
+      );
       child.stderr.on("data", () => undefined);
       const output = Writable.toWeb(child.stdin) as unknown as Parameters<typeof ndJsonStream>[0];
       const rawInput = Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>;
@@ -519,6 +554,7 @@ class AcpRuntime {
     const runtime = new AcpRuntime(stream, child, closeConnector, whenConnectorClosed, options);
     onPartialWireRead = () => runtime.notePartialWireRead();
     try {
+      const timeoutMs = options.options.acpOptions?.startupTimeoutMs ?? 10_000;
       const initialize = withTimeout(
         runtime.call(
           runtime.connection.initialize({
@@ -527,8 +563,12 @@ class AcpRuntime {
             clientInfo: { name: "paseo", version: "1" },
           }),
         ),
-        options.options.acpOptions?.startupTimeoutMs ?? 10_000,
-        `ACP provider ${options.options.id} did not initialize`,
+        timeoutMs,
+        () =>
+          new AcpStartupError(`ACP provider ${options.options.id} did not initialize`, {
+            reason: "timeout",
+            timeoutMs,
+          }),
       );
       const initialized = spawnFailure
         ? await Promise.race([initialize, spawnFailure])
@@ -536,7 +576,19 @@ class AcpRuntime {
       runtime.agentCapabilities = initialized.agentCapabilities ?? {};
       return runtime;
     } catch (error) {
+      const closedBeforeInit =
+        !(error instanceof AcpStartupError) &&
+        !(error instanceof RequestError) &&
+        (runtime.connection.signal.aborted ||
+          (child !== null && (child.exitCode !== null || child.signalCode !== null)) ||
+          (error instanceof Error &&
+            (error.message === "ACP connection closed" ||
+              error.message === "ACP transport closed unexpectedly" ||
+              error.message === "ACP transport is closed")));
       await runtime.close();
+      if (closedBeforeInit) {
+        throw new AcpStartupError(describeError(error), { reason: "closed", cause: error });
+      }
       throw error;
     }
   }
@@ -2451,10 +2503,13 @@ function describeError(error: unknown): string {
 function withTimeout<Value>(
   promise: Promise<Value>,
   timeoutMs: number,
-  message: string,
+  messageOrError: string | (() => Error),
 ): Promise<Value> {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+    const timeout = setTimeout(
+      () => reject(typeof messageOrError === "function" ? messageOrError() : new Error(messageOrError)),
+      timeoutMs,
+    );
     promise.then(
       (value) => {
         clearTimeout(timeout);
