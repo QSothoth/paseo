@@ -150,10 +150,18 @@ function describeVersion(inspection: ProviderInstallationInspection): string {
   return inspection.version?.trim() || "unknown";
 }
 
+class ProviderExecutableNotFoundError extends Error {
+  constructor(public readonly command: string) {
+    super(`${command} not found on PATH`);
+    this.name = "ProviderExecutableNotFoundError";
+  }
+}
+
 class ProviderRuntime {
   private connection: ProviderConnection | null = null;
   connectedLaunch: ProviderLaunch | undefined;
   private connecting: Promise<ProviderConnection> | null = null;
+  private listingConnect: Promise<ProviderConnection | null> | null = null;
   private closed = false;
   private generation = 0;
   private closePromise: Promise<void> | null = null;
@@ -211,7 +219,7 @@ class ProviderRuntime {
   private async resolveLaunch(): Promise<ProviderLaunch | undefined> {
     const launch = await this.resolveEffectiveLaunch();
     if (!launch) return undefined;
-    if (!launch.resolved) throw new Error(`${launch.command} not found on PATH`);
+    if (!launch.resolved) throw new ProviderExecutableNotFoundError(launch.command);
     return { command: launch.command, args: launch.args, env: launch.env };
   }
 
@@ -284,6 +292,10 @@ class ProviderRuntime {
     return callback({ ...options, launch: await this.resolveLaunch() });
   }
 
+  get hasNegotiatedCapabilities(): boolean {
+    return this.connection !== null;
+  }
+
   get negotiatedCapabilities(): readonly string[] {
     return this.connection?.capabilities ?? [];
   }
@@ -312,8 +324,8 @@ class ProviderRuntime {
       limit?: number;
     } = {},
   ): Promise<Extract<ProviderEvent, { type: "sessions" }>["sessions"]> {
-    const connection = await this.getConnection();
-    if (!connection.capabilities.includes("session.list")) return [];
+    const connection = await this.ensureConnectionForListing();
+    if (!connection || !connection.capabilities.includes("session.list")) return [];
     const event = await this.complete({ type: "sessions", requestId: randomUUID(), ...input });
     if (event.type !== "sessions")
       throw new Error("Provider returned an invalid sessions response");
@@ -391,6 +403,7 @@ class ProviderRuntime {
     const connection = this.connection;
     const connecting = connection ? null : this.connecting;
     this.connection = null;
+    this.listingConnect = null;
     this.unsubscribe?.();
     this.unsubscribe = null;
     for (const session of this.sessions.values()) session.connectionClosed();
@@ -451,12 +464,61 @@ class ProviderRuntime {
     this.providerSessions.delete(providerSessionId);
   }
 
-  private getConnection(): Promise<ProviderConnection> {
+  private ensureConnectionForListing(): Promise<ProviderConnection | null> {
+    if (this.closed) return Promise.reject(new Error("Provider runtime is closed"));
+    if (this.connection) return Promise.resolve(this.connection);
+    if (this.connecting) {
+      return this.connecting.catch((error) => {
+        if (error instanceof ProviderExecutableNotFoundError) return null;
+        throw error;
+      });
+    }
+    if (this.listingConnect) return this.listingConnect;
+    const generation = this.generation;
+    const pending = this.connectForListing(generation);
+    this.listingConnect = pending;
+    pending.then(
+      () => {
+        if (this.listingConnect === pending) this.listingConnect = null;
+        return undefined;
+      },
+      () => {
+        if (this.listingConnect === pending) this.listingConnect = null;
+        return undefined;
+      },
+    );
+    return pending;
+  }
+
+  private async connectForListing(generation: number): Promise<ProviderConnection | null> {
+    let launch: ProviderLaunch | undefined;
+    try {
+      launch = await this.resolveLaunch();
+    } catch (error) {
+      if (error instanceof ProviderExecutableNotFoundError) return null;
+      throw error;
+    }
+    if (this.closed || generation !== this.generation) {
+      throw new Error("Provider runtime is closed");
+    }
+    if (this.registration.status) {
+      const status = ProviderStatusSchema.parse(await this.registration.status({ launch }));
+      if (this.closed || generation !== this.generation) {
+        throw new Error("Provider runtime is closed");
+      }
+      if (!status.available) return null;
+    }
+    return await this.getConnection({ resolvedLaunch: { value: launch } });
+  }
+
+  private getConnection(options?: {
+    resolvedLaunch?: { value: ProviderLaunch | undefined };
+  }): Promise<ProviderConnection> {
     if (this.closed) return Promise.reject(new Error("Provider runtime is closed"));
     if (this.connection) return Promise.resolve(this.connection);
     if (this.connecting) return this.connecting;
     const generation = this.generation;
-    const connecting = this.establishConnection(generation);
+    const connecting = this.establishConnection(generation, options?.resolvedLaunch);
     this.connecting = connecting;
     connecting.then(
       () => {
@@ -471,8 +533,11 @@ class ProviderRuntime {
     return connecting;
   }
 
-  private async establishConnection(generation: number): Promise<ProviderConnection> {
-    const launch = await this.resolveLaunch();
+  private async establishConnection(
+    generation: number,
+    resolvedLaunch?: { value: ProviderLaunch | undefined },
+  ): Promise<ProviderConnection> {
+    const launch = resolvedLaunch ? resolvedLaunch.value : await this.resolveLaunch();
     const rawConnection = await this.registration.connect({
       launch,
       versions: [PROVIDER_PROTOCOL_VERSION],
@@ -1090,7 +1155,9 @@ class PluginAgentClient implements AgentClient {
   }
 
   get capabilities(): AgentCapabilityFlags {
-    return agentCapabilities(this.runtime.negotiatedCapabilities);
+    return agentCapabilities(this.runtime.negotiatedCapabilities, {
+      lazySessionListing: !this.runtime.hasNegotiatedCapabilities && !this.runtime.isClosed,
+    });
   }
 
   async createSession(
@@ -2068,12 +2135,15 @@ class PluginAgentSession implements AgentSession {
   }
 }
 
-function agentCapabilities(capabilities: readonly string[]): AgentCapabilityFlags {
+function agentCapabilities(
+  capabilities: readonly string[],
+  options?: { lazySessionListing?: boolean },
+): AgentCapabilityFlags {
   const supports = (capability: ProviderCapability) => capabilities.includes(capability);
   return {
     supportsStreaming: true,
     supportsSessionPersistence: supports("session.persistence"),
-    supportsSessionListing: supports("session.list"),
+    supportsSessionListing: options?.lazySessionListing === true || supports("session.list"),
     supportsDynamicModes: supports("session.configure"),
     supportsMcpServers: true,
     supportsNativePaseoTools: false,
